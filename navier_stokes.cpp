@@ -41,6 +41,7 @@
 
 #include <fstream>
 #include <iostream>
+#include <string>
 
 using namespace dealii;
 
@@ -99,11 +100,11 @@ struct NavierStokesParameters
     }
     prm.leave_subsection();
 
-    prm.enter_subsection("Newton parameters");
+    prm.enter_subsection("Linearization parameters");
     {
-      prm.add_parameter("Newton", newton);
-      prm.add_parameter("Starting damping parameter", starting_damping_parameter);
-      prm.add_parameter("Dynamic damping", dynamic_damping);
+      prm.add_parameter("Picard", picard);
+      prm.add_parameter("Picard to Newton threshold", picard_to_newton_threshold);
+      prm.add_parameter("Tollerance", tollerance);
     }
     prm.leave_subsection();
 
@@ -145,11 +146,6 @@ struct NavierStokesParameters
                             constants, false);
 
     }
-
-    if(!newton) {
-      dynamic_damping = false;
-      starting_damping_parameter = 1;
-    }
     
   }
   double eta = 1.0;
@@ -165,16 +161,14 @@ struct NavierStokesParameters
   double coarsening_percentage = 0;
   int number_of_time_cycles = 1;
 
-  bool newton = true;
-  double starting_damping_parameter = 1;
-  bool dynamic_damping = false;
+  bool picard = false;
+  double picard_to_newton_threshold = 1e-3;
+  double tollerance = 1e-12;
 
   std::string                  initial_velocity_field_expression = "if(y>0.9999999,1,0); 0; 0";
   std::string                  rhs_expression            = "0; 0; 0";
   std::string                  exact_solution_expression            = "if(y>0.9999999,1,0); 0; 0";
   bool rhs_time_dependent            = false;
-
-  bool pressure_error_estimation = true;
 
   FunctionParser<dim> initial_velocity_field;
   mutable FunctionParser<dim> exact_solution;
@@ -379,10 +373,8 @@ NavierStokes<dim>::assemble_system_and_solve()
   
   //Variabili per Newton step precedente
   double residue = 0;
-  double tol = 1e-12;
   Vector<double> old_newton_solution(dof_handler.n_dofs());
-  double old_residue, damping_parameter;
-  Vector<double> newton_dx;
+  bool using_picard = par.picard;
 
   std::vector<Tensor<1,dim>> old_newton_function_values(fe_values.n_quadrature_points);
   std::vector<Tensor<2,dim>> old_newton_function_gradients(fe_values.n_quadrature_points);
@@ -410,8 +402,6 @@ NavierStokes<dim>::assemble_system_and_solve()
     setup_constraints();
 
     old_newton_solution = old_time_solution;
-    old_residue = -1;
-    damping_parameter = par.starting_damping_parameter;
 
     do {
       system_matrix = 0;
@@ -487,7 +477,7 @@ NavierStokes<dim>::assemble_system_and_solve()
                 //termine di trasporto linearizzato
                 to_sum_cell_matrix += par.theta * par.time_step_length * grad_u_j_1 * old_newton_function_values[q_index]*v_i;
                 //Non appare in Picard
-                if(par.newton)
+                if(!using_picard)
                   to_sum_cell_matrix += par.theta * par.time_step_length * old_newton_function_gradients[q_index]*u_j*v_i;
 
                 cell_matrix(i,j) += to_sum_cell_matrix*JxW;
@@ -500,18 +490,16 @@ NavierStokes<dim>::assemble_system_and_solve()
 
               to_sum_rhs -= (1-par.theta) * par.time_step_length 
                     * (par.eta * scalar_product(old_time_function_gradients[q_index], grad_v_i));
-                   
 
               to_sum_rhs -= (1-par.theta) * par.time_step_length *
                               old_time_function_gradients[q_index] *
                               old_time_function_values[q_index]*v_i;     
 
               //Non appare in Picard
-              if(par.newton)
+              if(!using_picard)
                 to_sum_rhs += par.theta* par.time_step_length * old_newton_function_gradients[q_index]*old_newton_function_values[q_index]*v_i;
 
               if (comp_i < dim) {
-
                 if (par.rhs_time_dependent)
                   to_sum_rhs += par.time_step_length * (v_i[comp_i] * // phi_i(x_q)
                     ((1 - par.theta) * par.rhs_function_prev_time_step.value(x_q, comp_i) + par.theta * par.rhs_function.value(x_q, comp_i))
@@ -521,7 +509,6 @@ NavierStokes<dim>::assemble_system_and_solve()
                   to_sum_rhs += par.time_step_length * (v_i[comp_i] * // phi_i(x_q)
                       par.rhs_function.value(x_q, comp_i)
                     );  
-                    
               }
       
 
@@ -533,116 +520,93 @@ NavierStokes<dim>::assemble_system_and_solve()
         constraints.distribute_local_to_global(
           cell_matrix, cell_rhs, local_dof_indices, system_matrix, system_rhs);
       }
-      
 
       solve();
 
-      //solution = dx
-      damping_parameter*=2;
+      old_newton_solution = solution;
 
-      solution -= old_newton_solution;
-      solution *= damping_parameter;
+      residue_vector=0;
 
-      old_newton_solution += solution;
-      
-      //Il metodo consiste nel abbassare il damping parameter finché non si ha un residuo più piccolo del precedente
-      //Quindi per la prima iterazione del metodo di Newton non abbiamo paragoni e dobbiamo andare "sulla fiducia"
-      //Il modo migliore per garantirne la convergenza è partire da un damping parameter basso
-      do {
-        damping_parameter /= 2;
-        solution /= 2;
+      //Calcolo residuo
+      for(const auto &cell : dof_handler.active_cell_iterators()) {
+        fe_values.reinit(cell);
 
-        //Diventa u(k+1) = u(k)+alpha/2 dx
-        old_newton_solution -= solution;
+        cell_residue_vector = 0;
 
-        residue_vector=0;
+        //un
+        fe_values[velocity].get_function_values(old_time_solution, old_time_function_values);
+        fe_values[velocity].get_function_gradients(old_time_solution, old_time_function_gradients);
 
-        //Calcolo residuo
-        for(const auto &cell : dof_handler.active_cell_iterators()) {
-          fe_values.reinit(cell);
+        //un+1
+        fe_values[velocity].get_function_values(old_newton_solution, old_newton_function_values);
+        fe_values[velocity].get_function_gradients(old_newton_solution, old_newton_function_gradients);
+        fe_values[velocity].get_function_divergences(old_newton_solution, old_newton_function_divergences);
 
-          cell_residue_vector = 0;
+        fe_values[pressure].get_function_values(old_newton_solution, old_newton_pressure_values);
 
-          //un
-          fe_values[velocity].get_function_values(old_time_solution, old_time_function_values);
-          fe_values[velocity].get_function_gradients(old_time_solution, old_time_function_gradients);
-
-          //un+1
-          fe_values[velocity].get_function_values(old_newton_solution, old_newton_function_values);
-          fe_values[velocity].get_function_gradients(old_newton_solution, old_newton_function_gradients);
-          fe_values[velocity].get_function_divergences(old_newton_solution, old_newton_function_divergences);
-
-          fe_values[pressure].get_function_values(old_newton_solution, old_newton_pressure_values);
-
+        
+        for (const unsigned int q_index : fe_values.quadrature_point_indices()) {
+          const auto &x_q = fe_values.quadrature_point(q_index);
           
-          for (const unsigned int q_index : fe_values.quadrature_point_indices()) {
-            const auto &x_q = fe_values.quadrature_point(q_index);
-            
-            double JxW = fe_values.JxW(q_index);
+          double JxW = fe_values.JxW(q_index);
 
-            for (const unsigned int i : fe_values.dof_indices()) 
-            {
-              double to_sum_cell_residue = 0;
+          for (const unsigned int i : fe_values.dof_indices()) 
+          {
+            double to_sum_cell_residue = 0;
 
-              const unsigned int comp_i = fe.system_to_component_index(i).first;
+            const unsigned int comp_i = fe.system_to_component_index(i).first;
 
-              const auto v_i      = fe_values[velocity].value(i, q_index);
-              const auto div_v_i  = fe_values[velocity].divergence(i, q_index);
-              const auto grad_v_i = fe_values[velocity].gradient(i, q_index);
+            const auto v_i      = fe_values[velocity].value(i, q_index);
+            const auto div_v_i  = fe_values[velocity].divergence(i, q_index);
+            const auto grad_v_i = fe_values[velocity].gradient(i, q_index);
 
-              const auto q_i = fe_values[pressure].value(i, q_index);
+            const auto q_i = fe_values[pressure].value(i, q_index);
 
-              to_sum_cell_residue +=
-                scalar_product(old_newton_function_values[q_index], v_i);
+            to_sum_cell_residue +=
+              scalar_product(old_newton_function_values[q_index], v_i);
 
-              //(costanti * (nabla u_n+1, nabla v))
-              to_sum_cell_residue += par.theta * par.time_step_length *
-                (par.eta * scalar_product(old_newton_function_gradients[q_index], grad_v_i));                    
+            //(costanti * (nabla u_n+1, nabla v))
+            to_sum_cell_residue += par.theta * par.time_step_length *
+              (par.eta * scalar_product(old_newton_function_gradients[q_index], grad_v_i));                    
 
-              //termine di trasporto
-              to_sum_cell_residue += par.theta * par.time_step_length * old_newton_function_gradients[q_index] * old_newton_function_values[q_index]*v_i;
-              to_sum_cell_residue += (1-par.theta)   * par.time_step_length * old_time_function_gradients[q_index] * old_time_function_values[q_index]*v_i;
+            //termine di trasporto
+            to_sum_cell_residue += par.theta * par.time_step_length * old_newton_function_gradients[q_index] * old_newton_function_values[q_index]*v_i;
+            to_sum_cell_residue += (1-par.theta) * par.time_step_length * old_time_function_gradients[q_index] * old_time_function_values[q_index]*v_i;
 
-              //(div u_n+1, q) - (div v, p_n+1)
-              to_sum_cell_residue -= par.time_step_length * (old_newton_function_divergences[q_index] * q_i);
-              to_sum_cell_residue -= par.time_step_length * (div_v_i * old_newton_pressure_values[q_index]);
+            //(div u_n+1, q) - (div v, p_n+1)
+            to_sum_cell_residue -= par.time_step_length * (old_newton_function_divergences[q_index] * q_i);
+            to_sum_cell_residue -= par.time_step_length * (div_v_i * old_newton_pressure_values[q_index]);
 
-              to_sum_cell_residue -= scalar_product(old_time_function_values[q_index], v_i) ;
-              to_sum_cell_residue += (1-par.theta) * par.time_step_length 
-                    * (par.eta * scalar_product(old_time_function_gradients[q_index], grad_v_i));
+            to_sum_cell_residue -= scalar_product(old_time_function_values[q_index], v_i) ;
+            to_sum_cell_residue += (1-par.theta) * par.time_step_length 
+                  * (par.eta * scalar_product(old_time_function_gradients[q_index], grad_v_i));
 
-              if (comp_i < dim) {
-                if(par.rhs_time_dependent)
-                  to_sum_cell_residue -= par.time_step_length * (v_i[comp_i] * // phi_i(x_q)
-                    ((1 - par.theta) * par.rhs_function_prev_time_step.value(x_q, comp_i) + par.theta * par.rhs_function.value(x_q, comp_i))); // f(x_q));              // dx
-                
-                else
-                  to_sum_cell_residue -= par.time_step_length * (v_i[comp_i] * // phi_i(x_q)
-                    par.rhs_function.value(x_q, comp_i)); // f(x_q));              // dx
-                
-              }
-                  
-              cell_residue_vector(i) += to_sum_cell_residue * JxW;
+            if (comp_i < dim) {
+              if(par.rhs_time_dependent)
+                to_sum_cell_residue -= par.time_step_length * (v_i[comp_i] * // phi_i(x_q)
+                  ((1 - par.theta) * par.rhs_function_prev_time_step.value(x_q, comp_i) + par.theta * par.rhs_function.value(x_q, comp_i))); // f(x_q));              // dx
+              
+              else
+                to_sum_cell_residue -= par.time_step_length * (v_i[comp_i] * // phi_i(x_q)
+                  par.rhs_function.value(x_q, comp_i)); // f(x_q));              // dx
+              
             }
+                
+            cell_residue_vector(i) += to_sum_cell_residue * JxW;
           }
-
-          cell->get_dof_indices(local_dof_indices);
-          constraints.distribute_local_to_global(
-            cell_residue_vector, local_dof_indices, residue_vector);
         }
 
-        residue = residue_vector.l2_norm();
-        std::cout<<"Time step " << time_step << ", residue: "<< residue <<", damping: " << damping_parameter << "\n";
-      } while(par.dynamic_damping && old_residue != -1 && residue > old_residue);
-
-      if(par.dynamic_damping) {
-        damping_parameter*=2;
-        if(damping_parameter > 1) damping_parameter = 1;
+        cell->get_dof_indices(local_dof_indices);
+        constraints.distribute_local_to_global(
+          cell_residue_vector, local_dof_indices, residue_vector);
       }
+
+      residue = residue_vector.l2_norm();
+      std::cout<<"Time step " << time_step << ", residue: "<< residue << "\n";
       
-      old_residue = residue;
-      
-    } while(residue > tol);
+      if (using_picard && residue < par.picard_to_newton_threshold) using_picard = false;
+
+    } while(residue > par.tollerance);
 
     solution = old_newton_solution;
     old_time_solution = solution;
@@ -722,11 +686,9 @@ NavierStokes<dim>::run()
           mark();
           refine();
         }
-      //compute_first_time_step_pressure();
       setup_system();
       assemble_system_and_solve();
       estimate();
-      output_results(cycle);
       par.convergence_table.error_from_exact(dof_handler,
                                              solution,
                                              par.exact_solution);
