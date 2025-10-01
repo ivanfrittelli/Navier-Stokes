@@ -50,10 +50,10 @@ template <int dim, int spacedim>
 struct NavierStokesParameters
 {
   NavierStokesParameters()
-    : initial_velocity_field(spacedim + 1),
-    exact_solution(spacedim + 1),
-    rhs_function(spacedim + 1),
-    rhs_function_prev_time_step(spacedim+1),
+    : initial_velocity_field(dim == spacedim ? spacedim + 1 : spacedim + 2),
+    exact_solution(dim == spacedim ? spacedim + 1 : spacedim + 2),
+    rhs_function(dim == spacedim ? spacedim + 1 : spacedim + 2),
+    rhs_function_prev_time_step(dim == spacedim ? spacedim + 1 : spacedim + 2),
     convergence_table(spacedim == 2 ?
                           std::vector<std::string>({{"u", "u", "p"}}) :
                           std::vector<std::string>({{"u", "u", "u", "p"}}),
@@ -236,6 +236,7 @@ private:
 
   FEValuesExtractors::Vector velocity;
   FEValuesExtractors::Scalar pressure;
+  FEValuesExtractors::Scalar lambda;
 
   Vector<double> old_time_solution;
 };
@@ -244,12 +245,16 @@ private:
 template <int dim, int spacedim>
 NavierStokes<dim, spacedim>::NavierStokes(const NavierStokesParameters<dim, spacedim> &par)
   : par(par)
-  , fe(FE_Q<dim, spacedim>(par.fe_degree+1), spacedim, FE_Q<dim, spacedim>(par.fe_degree), 1)
   , dof_handler(triangulation)
   , velocity(0)
-  , pressure(dim)
+  , pressure(spacedim)
+  , lambda (spacedim+1)
+  , fe((dim == spacedim) ? 
+    FESystem<dim, spacedim>(FE_Q<dim, spacedim>(par.fe_degree+1), spacedim, FE_Q<dim, spacedim>(par.fe_degree), 1) :
+    FESystem<dim, spacedim>(FE_Q<dim, spacedim>(par.fe_degree+1), spacedim, FE_Q<dim, spacedim>(par.fe_degree), 1, FE_Q<dim, spacedim>(par.fe_degree+1), 1)
+  )
 {
-  
+
 }
 
 
@@ -263,7 +268,7 @@ NavierStokes<dim, spacedim>::make_grid()
   if (dim == spacedim)
     GridGenerator::hyper_cube(triangulation, 0, 1, false);
   else
-    GridGenerator::torus<dim>(triangulation, 1.618, 1);
+    GridGenerator::torus<dim>(triangulation, 2, 1);
 
   triangulation.refine_global(par.initial_refinement);
 
@@ -377,7 +382,7 @@ NavierStokes<dim, spacedim>::assemble_system_and_solve()
 
     std::cout<<"Time step " << time_step << "\n";
 
-    theta_time_step();
+    imex_time_step();
 
     old_time_solution = solution;
     output_results(time_step);
@@ -390,10 +395,14 @@ void
 NavierStokes<dim, spacedim>::theta_time_step() {
   QGauss<dim>     quadrature_formula(fe.degree + 2);
 
+  auto update_flags = update_values | update_gradients |
+                            update_quadrature_points | update_JxW_values;
+
+  if(dim != spacedim) update_flags |= update_normal_vectors;
+
   FEValues<dim, spacedim> fe_values(fe,
                           quadrature_formula,
-                          update_values | update_gradients |
-                            update_quadrature_points | update_JxW_values);
+                          update_flags);
 
   const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
 
@@ -418,6 +427,7 @@ NavierStokes<dim, spacedim>::theta_time_step() {
   std::vector<double> old_newton_function_divergences(fe_values.n_quadrature_points);
 
   std::vector<double> old_newton_pressure_values(fe_values.n_quadrature_points);
+  std::vector<double> old_newton_lambda_values(fe_values.n_quadrature_points);
 
   Vector<double> residue_vector(dof_handler.n_dofs());
   Vector<double> cell_residue_vector(dofs_per_cell);
@@ -427,6 +437,7 @@ NavierStokes<dim, spacedim>::theta_time_step() {
   std::vector<Tensor<2,spacedim>> grad_u(dofs_per_cell);
   std::vector<double> div_u(dofs_per_cell);
   std::vector<double> p(dofs_per_cell);
+  std::vector<double> l(dofs_per_cell);
 
   old_newton_solution = old_time_solution;
 
@@ -439,6 +450,11 @@ NavierStokes<dim, spacedim>::theta_time_step() {
       fe_values.reinit(cell);
       cell_matrix = 0;
       cell_rhs    = 0;
+
+      Tensor<1, spacedim> normal_vector;
+      
+      if(dim != spacedim)
+        normal_vector = fe_values.normal_vector(0);
               
       fe_values[velocity].get_function_values(old_time_solution, old_time_function_values);
       fe_values[velocity].get_function_gradients(old_time_solution, old_time_function_gradients);
@@ -455,6 +471,9 @@ NavierStokes<dim, spacedim>::theta_time_step() {
           grad_u[i] = fe_values[velocity].gradient(i, q_index);
           div_u[i] = fe_values[velocity].divergence(i, q_index);
           p[i] = fe_values[pressure].value(i, q_index);
+
+          if(dim != spacedim)
+            l[i] = fe_values[lambda].value(i, q_index);
         }
                       
         const auto &x_q = fe_values.quadrature_point(q_index);
@@ -485,6 +504,12 @@ NavierStokes<dim, spacedim>::theta_time_step() {
 
               to_sum_cell_matrix -= par.time_step_length * (div_u_j * q_i);
               to_sum_cell_matrix -= par.time_step_length * (div_v_i * p_j);
+
+              if(dim != spacedim)
+              {
+                to_sum_cell_matrix -= par.time_step_length * (scalar_product(u_j, normal_vector) * l[i]);
+                to_sum_cell_matrix -= par.time_step_length * (scalar_product(v_i, normal_vector) * l[j]);
+              }
 
               cell_matrix(i,j) += to_sum_cell_matrix*JxW;
 
@@ -559,6 +584,11 @@ NavierStokes<dim, spacedim>::theta_time_step() {
     for(const auto &cell : dof_handler.active_cell_iterators()) {
       fe_values.reinit(cell);
 
+      Tensor<1, spacedim> normal_vector;
+      
+      if(dim != spacedim)
+        normal_vector = fe_values.normal_vector(0);
+
       cell_residue_vector = 0;
 
       //un
@@ -571,6 +601,9 @@ NavierStokes<dim, spacedim>::theta_time_step() {
       fe_values[velocity].get_function_divergences(old_newton_solution, old_newton_function_divergences);
 
       fe_values[pressure].get_function_values(old_newton_solution, old_newton_pressure_values);
+
+      if(dim != spacedim)
+        fe_values[lambda].get_function_values(old_newton_solution, old_newton_lambda_values);
 
       
       for (const unsigned int q_index : fe_values.quadrature_point_indices()) {
@@ -590,6 +623,10 @@ NavierStokes<dim, spacedim>::theta_time_step() {
 
           const auto q_i = fe_values[pressure].value(i, q_index);
 
+          double w_i;
+          if(dim != spacedim)
+            w_i = fe_values[lambda].value(i, q_index);
+
           to_sum_cell_residue +=
             scalar_product(old_newton_function_values[q_index], v_i);
 
@@ -604,6 +641,11 @@ NavierStokes<dim, spacedim>::theta_time_step() {
           //(div u_n+1, q) - (div v, p_n+1)
           to_sum_cell_residue -= par.time_step_length * (old_newton_function_divergences[q_index] * q_i);
           to_sum_cell_residue -= par.time_step_length * (div_v_i * old_newton_pressure_values[q_index]);
+
+          if(dim != spacedim) {
+            to_sum_cell_residue -= par.time_step_length * (scalar_product(old_newton_function_values[q_index], normal_vector) * w_i);
+            to_sum_cell_residue -= par.time_step_length * (scalar_product(v_i, normal_vector) * old_newton_lambda_values[q_index]);
+          }
 
           to_sum_cell_residue -= scalar_product(old_time_function_values[q_index], v_i) ;
           to_sum_cell_residue += (1-par.theta) * par.time_step_length 
@@ -644,11 +686,14 @@ void
 NavierStokes<dim, spacedim>::imex_time_step() {
   QGauss<dim>     quadrature_formula(fe.degree + 2);
 
+  auto update_flags = update_values | update_gradients |
+                            update_quadrature_points | update_JxW_values;
+
+  if(dim != spacedim) update_flags |= update_normal_vectors;
+
   FEValues<dim, spacedim> fe_values(fe,
                           quadrature_formula,
-                          update_values | update_gradients |
-                            update_quadrature_points | update_JxW_values);
-
+                          update_flags);
   const unsigned int dofs_per_cell = fe.n_dofs_per_cell();
 
   FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
@@ -667,6 +712,7 @@ NavierStokes<dim, spacedim>::imex_time_step() {
   std::vector<Tensor<2,spacedim>> grad_u(dofs_per_cell);
   std::vector<double> div_u(dofs_per_cell);
   std::vector<double> p(dofs_per_cell);
+  std::vector<double> l(dofs_per_cell);
 
   system_matrix = 0;
   system_rhs=0;
@@ -676,6 +722,11 @@ NavierStokes<dim, spacedim>::imex_time_step() {
     fe_values.reinit(cell);
     cell_matrix = 0;
     cell_rhs    = 0;
+
+    Tensor<1, spacedim> normal_vector;
+    
+    if(dim != spacedim)
+      normal_vector = fe_values.normal_vector(0);
             
     fe_values[velocity].get_function_values(old_time_solution, old_time_function_values);
     fe_values[velocity].get_function_gradients(old_time_solution, old_time_function_gradients);
@@ -689,6 +740,9 @@ NavierStokes<dim, spacedim>::imex_time_step() {
         grad_u[i] = fe_values[velocity].gradient(i, q_index);
         div_u[i] = fe_values[velocity].divergence(i, q_index);
         p[i] = fe_values[pressure].value(i, q_index);
+        
+        if(dim != spacedim)
+          l[i] = fe_values[lambda].value(i, q_index);
       }
                     
       const auto &x_q = fe_values.quadrature_point(q_index);
@@ -719,6 +773,12 @@ NavierStokes<dim, spacedim>::imex_time_step() {
 
             to_sum_cell_matrix -= par.time_step_length * (div_u_j * q_i);
             to_sum_cell_matrix -= par.time_step_length * (div_v_i * p_j);
+
+            if(dim != spacedim)
+              {
+                to_sum_cell_matrix -= par.time_step_length * (scalar_product(u_j, normal_vector) * l[i]);
+                to_sum_cell_matrix -= par.time_step_length * (scalar_product(v_i, normal_vector) * l[j]);
+              }
 
             cell_matrix(i,j) += to_sum_cell_matrix*JxW;
 
@@ -784,11 +844,18 @@ NavierStokes<dim, spacedim>::output_results(const unsigned int time_step) const
   std::vector<std::string> names(spacedim + 1, "u");
   names[spacedim] = "p"; // last component is pressure
 
+  if(dim != spacedim)
+    names.push_back("l");
+
   std::vector<DataComponentInterpretation::DataComponentInterpretation>
     component_interpretation(
       spacedim, DataComponentInterpretation::component_is_part_of_vector);
   component_interpretation.push_back(
     DataComponentInterpretation::component_is_scalar);
+
+  if(dim != spacedim)
+    component_interpretation.push_back(
+      DataComponentInterpretation::component_is_scalar);
 
   data_out.attach_dof_handler(dof_handler);
   data_out.add_data_vector(solution,
